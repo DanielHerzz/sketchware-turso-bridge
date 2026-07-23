@@ -11,11 +11,6 @@ const client = createClient({
 // ============================================
 // مفاتيح الأمان
 // ============================================
-// يمكن تعيين مفتاح API اختياري لحماية الخادم
-// إذا تم تعيين APP_SECRET_KEY في Vercel Environment Variables
-// فكل طلب يجب أن يحتوي على header: x-api-key
-// ============================================
-
 const APP_SECRET = process.env.APP_SECRET_KEY || '';
 
 function verifyApiKey(headers) {
@@ -24,8 +19,20 @@ function verifyApiKey(headers) {
 }
 
 // ============================================
-// دالة مساعدة لتنفيذ SQL بأمان
+// دوال مساعدة
 // ============================================
+
+// تنظيف اسم العمود (حماية ضد SQL Injection)
+function cleanColName(name) {
+  return String(name).replace(/[^a-zA-Z0-9_]/g, '');
+}
+
+// تنظيف اسم الجدول
+function cleanTableName(name) {
+  return String(name).replace(/[^a-zA-Z0-9_]/g, '');
+}
+
+// تنفيذ SQL
 async function executeSQL(sql, params = []) {
   try {
     const result = await client.execute({ sql, args: params });
@@ -49,9 +56,7 @@ async function executeSQL(sql, params = []) {
   }
 }
 
-// ============================================
-// دالة لتنفيذ عدة استعلامات (Batch)
-// ============================================
+// تنفيذ عدة استعلامات
 async function executeBatch(statements) {
   const results = [];
   try {
@@ -82,14 +87,21 @@ async function executeBatch(statements) {
   }
 }
 
+// تحديد عمود الـ ID (يدعم id أو _id أو أي اسم مخصص)
+function findIdColumn(columns) {
+  if (columns.some(c => c.name === 'id')) return 'id';
+  if (columns.some(c => c.name === '_id')) return '_id';
+  // ابحث عن أي عمود يحتوي على "id"
+  const idCol = columns.find(c => c.name.toLowerCase().includes('id'));
+  return idCol ? idCol.name : 'id';
+}
+
 // ============================================
 // Vercel Serverless Function Handler
 // ============================================
 module.exports = async function handler(request, response) {
   
-  // ==========================================
-  // إعداد CORS (السماح بالطلبات من أي مصدر)
-  // ==========================================
+  // إعداد CORS
   response.setHeader('Access-Control-Allow-Credentials', true);
   response.setHeader('Access-Control-Allow-Origin', '*');
   response.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
@@ -100,9 +112,7 @@ module.exports = async function handler(request, response) {
     return;
   }
 
-  // ==========================================
   // التحقق من مفتاح الأمان
-  // ==========================================
   if (!verifyApiKey(request.headers)) {
     response.status(401).json({ success: false, error: 'مفتاح API غير صالح' });
     return;
@@ -122,22 +132,24 @@ module.exports = async function handler(request, response) {
   const table = body.table || request.query.table;
 
   // ==========================================
-  // نقطة اختبار الاتصال
+  // 1. ping — اختبار الاتصال بالخادم
   // ==========================================
-  if (action === 'ping' || request.url === '/api?ping') {
+  // الاستخدام: للتأكد أن الخادم يعمل ومتصل بقاعدة البيانات
+  // لا يحتاج أي بيانات إضافية
+  // مثال: {"action": "ping"}
+  // ==========================================
+  if (action === 'ping') {
     response.json({
       success: true,
-      message: 'الخادم يعمل بنجاح ✅',
+      message: 'الخادم يعمل بنجاح',
       database: 'Turso (libSQL)',
       timestamp: new Date().toISOString()
     });
     return;
   }
 
-  // ==========================================
-  // التحقق من وجود اسم الجدول
-  // ==========================================
-  if (!table && action !== 'ping') {
+  // التحقق من وجود اسم الجدول (جميع العمليات الأخرى تحتاجه)
+  if (!table && action !== 'ping' && action !== 'get_tables' && action !== 'raw_query' && action !== 'batch') {
     response.status(400).json({
       success: false,
       error: 'يجب إرسال اسم الجدول في الحقل "table"'
@@ -145,25 +157,41 @@ module.exports = async function handler(request, response) {
     return;
   }
 
-  // حماية: تنظيف اسم الجدول (تجنب SQL Injection في اسم الجدول)
-  const cleanTable = String(table).replace(/[^a-zA-Z0-9_]/g, '');
-  if (!cleanTable) {
-    response.status(400).json({ success: false, error: 'اسم الجدول غير صالح' });
-    return;
+  if (table) {
+    var cleanTable = cleanTableName(table);
+    if (!cleanTable) {
+      response.status(400).json({ success: false, error: 'اسم الجدول غير صالح' });
+      return;
+    }
   }
 
   // ==========================================
-  // 1️⃣ إنشاء جدول جديد
+  // 2. create_table — إنشاء جدول جديد
+  // ==========================================
+  // الاستخدام: عند تشغيل التطبيق لأول مرة لإنشاء الجداول المطلوبة
+  // أو لإنشاء جدول جديد ديناميكيًا
+  // الحقول المطلوبة: table + columns
+  // columns: مصفوفة كائنات [{name: 'عمود', type: 'TEXT/INTEGER/REAL'}, ...]
+  // خصائص إضافية لكل عمود: primaryKey, autoIncrement, notNull, unique, default
+  // مثال:
+  // {
+  //   "action": "create_table",
+  //   "table": "users",
+  //   "columns": [
+  //     {"name": "name", "type": "TEXT", "notNull": true},
+  //     {"name": "age", "type": "INTEGER"}
+  //   ]
+  // }
   // ==========================================
   if (action === 'create_table') {
-    const columns = body.columns; // [{name: 'email', type: 'TEXT'}, {name: 'age', type: 'INTEGER'}]
+    const columns = body.columns;
     if (!columns || !Array.isArray(columns) || columns.length === 0) {
       response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة الأعمدة "columns"' });
       return;
     }
 
     const colDefs = columns.map(col => {
-      const name = String(col.name).replace(/[^a-zA-Z0-9_]/g, '');
+      const name = cleanColName(col.name);
       const type = String(col.type || 'TEXT').toUpperCase();
       const isPrimary = col.primaryKey ? ' PRIMARY KEY' : '';
       const isAutoIncrement = col.autoIncrement ? ' AUTOINCREMENT' : '';
@@ -173,7 +201,6 @@ module.exports = async function handler(request, response) {
       return `${name} ${type}${isPrimary}${isAutoIncrement}${isNotNull}${isUnique}${isDefault}`;
     });
 
-    // إضافة مفتاح رئيسي تلقائي إذا لم يتم تحديده
     const hasPrimary = columns.some(c => c.primaryKey);
     if (!hasPrimary) {
       colDefs.unshift('id INTEGER PRIMARY KEY AUTOINCREMENT');
@@ -186,7 +213,11 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 2️⃣ حذف جدول
+  // 3. drop_table — حذف جدول بالكامل
+  // ==========================================
+  // الاستخدام: حذف جدول وكل بياناته نهائياً (حذر!)
+  // لا يمكن التراجع بعد الحذف
+  // مثال: {"action": "drop_table", "table": "old_users"}
   // ==========================================
   if (action === 'drop_table') {
     const sql = `DROP TABLE IF EXISTS ${cleanTable}`;
@@ -196,9 +227,13 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 3️⃣ جلب جميع السجلات
+  // 4. get_all — جلب جميع السجلات
   // ==========================================
-  if (action === 'get_all' || action === 'read_all') {
+  // الاستخدام: جلب كل البيانات الموجودة في الجدول
+  // مثال: {"action": "get_all", "table": "users"}
+  // الرد: {success: true, data: {columns: [...], rows: [{...}, {...}]}}
+  // ==========================================
+  if (action === 'get_all') {
     const sql = `SELECT * FROM ${cleanTable}`;
     const result = await executeSQL(sql);
     response.json(result);
@@ -206,10 +241,18 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 4️⃣ جلب سجل واحد بالـ ID
+  // 5. get_by_id — جلب سجل واحد بالـ ID
   // ==========================================
-  if (action === 'get_by_id' || action === 'read_by_id') {
+  // الاستخدام: جلب سجل واحد فقط باستخدام رقمه (id)
+  // يحتاج: حقل "id"
+  // مثال: {"action": "get_by_id", "table": "users", "id": 5}
+  // ==========================================
+  if (action === 'get_by_id') {
     const id = body.id;
+    if (id === undefined || id === null) {
+      response.status(400).json({ success: false, error: 'يجب إرسال قيمة "id"' });
+      return;
+    }
     const sql = `SELECT * FROM ${cleanTable} WHERE id = ?`;
     const result = await executeSQL(sql, [id]);
     response.json(result);
@@ -217,10 +260,22 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 5️⃣ جلب سجلات بشرط (WHERE)
+  // 6. get_where — جلب سجلات بشرط محدد
   // ==========================================
-  if (action === 'get_where' || action === 'read_where') {
-    const where = body.where; // [{column: 'status', value: 'active', operator: '='}]
+  // الاستخدام: جلب سجلات محددة بشرط واحد أو أكثر
+  // يحتاج: مصفوفة "where" تحتوي على الشروط
+  // يدعم: =, !=, >, <, >=, <=, LIKE, NOT LIKE
+  // يدعم: LIMIT لتحديد عدد النتائج
+  // مثال:
+  // {
+  //   "action": "get_where",
+  //   "table": "users",
+  //   "where": [{"column": "age", "value": "25", "operator": ">="}],
+  //   "limit": 10
+  // }
+  // ==========================================
+  if (action === 'get_where') {
+    const where = body.where;
     if (!where || !Array.isArray(where) || where.length === 0) {
       response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة الشروط "where"' });
       return;
@@ -229,8 +284,8 @@ module.exports = async function handler(request, response) {
     const conditions = [];
     const values = [];
     where.forEach(w => {
-      const col = String(w.column).replace(/[^a-zA-Z0-9_]/g, '');
-      const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase()) 
+      const col = cleanColName(w.column);
+      const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase())
         ? String(w.operator || '=').toUpperCase() : '=';
       conditions.push(`${col} ${op} ?`);
       values.push(w.value);
@@ -244,16 +299,50 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 6️⃣ إضافة سجل جديد (INSERT)
+  // 7. insert — إضافة سجل واحد (الطريقة المباشرة)
   // ==========================================
-  if (action === 'insert' || action === 'add') {
-    const data = body.data; // {name: 'أحمد', email: 'ahmed@test.com', age: 25}
-    if (!data || typeof data !== 'object' || Object.keys(data).length === 0) {
-      response.status(400).json({ success: false, error: 'يجب إرسال بيانات السجل في الحقل "data"' });
+  // الاستخدام: إضافة سجل جديد إلى الجدول
+  // 
+  // ** الطريقة الأولى (مباشرة - الأسهل): **
+  // ضع action و table مباشرة في الـ Map مع بقية البيانات
+  // كل الحقول الأخرى سيتم إضافتها تلقائياً كسجل
+  //
+  // مثال من Sketchware (ما تفعله أنت):
+  //   map: action = insert
+  //   map: table = users
+  //   map: name = أحمد       ← هذا يضاف كحقل في السجل
+  //   map: email = a@b.com  ← هذا يضاف كحقل في السجل
+  //   map: uid = 12345      ← هذا يضاف كحقل في السجل
+  //
+  // ** الطريقة الثانية (مغلفة): **
+  // {
+  //   "action": "insert",
+  //   "table": "users",
+  //   "data": {"name": "أحمد", "email": "a@b.com"}
+  // }
+  //
+  // كلا الطريقتين تعملان! لكن الأولى أسهل مع Sketchware
+  // ==========================================
+  if (action === 'insert') {
+    // الطريقة المباشرة: نأخذ كل المفاتيح من body ما عدا action و table
+    const reservedKeys = ['action', 'table', 'data', 'where', 'columns', 'id', 'query', 
+                          'limit', 'orderBy', 'uniqueColumn', 'sql', 'params', 'statements'];
+    const dataKeys = Object.keys(body).filter(k => !reservedKeys.includes(k));
+    
+    let data;
+    if (body.data && typeof body.data === 'object' && Object.keys(body.data).length > 0) {
+      // الطريقة الثانية: البيانات في حقل data
+      data = body.data;
+    } else if (dataKeys.length > 0) {
+      // الطريقة الأولى: البيانات مباشرة في الـ Map
+      data = {};
+      dataKeys.forEach(k => { data[k] = body[k]; });
+    } else {
+      response.status(400).json({ success: false, error: 'يجب إرسال بيانات السجل' });
       return;
     }
 
-    const columns = Object.keys(data).map(c => String(c).replace(/[^a-zA-Z0-9_]/g, ''));
+    const columns = Object.keys(data).map(c => cleanColName(c));
     const placeholders = columns.map(() => '?').join(', ');
     const values = columns.map(c => data[c]);
     const sql = `INSERT INTO ${cleanTable} (${columns.join(', ')}) VALUES (${placeholders})`;
@@ -263,21 +352,31 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 7️⃣ إضافة عدة سجلات دفعة واحدة (BATCH INSERT)
+  // 8. batch_insert — إضافة عدة سجلات دفعة واحدة
   // ==========================================
-  if (action === 'batch_insert' || action === 'add_all') {
-    const dataArray = body.data; // [{name: 'أحمد'}, {name: 'محمد'}, ...]
+  // الاستخدام: إضافة عدة سجلات في طلب واحد (أسرع وأوفر)
+  // البيانات: مصفوفة من الكائنات في حقل "data"
+  // مثال:
+  // {
+  //   "action": "batch_insert",
+  //   "table": "users",
+  //   "data": [
+  //     {"name": "أحمد", "age": "25"},
+  //     {"name": "محمد", "age": "30"}
+  //   ]
+  // }
+  // ==========================================
+  if (action === 'batch_insert') {
+    const dataArray = body.data;
     if (!dataArray || !Array.isArray(dataArray) || dataArray.length === 0) {
       response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة البيانات في الحقل "data"' });
       return;
     }
 
-    // جلب الأعمدة من أول عنصر
-    const columns = Object.keys(dataArray[0]).map(c => String(c).replace(/[^a-zA-Z0-9_]/g, ''));
+    const columns = Object.keys(dataArray[0]).map(c => cleanColName(c));
     const placeholders = columns.map(() => '?').join(', ');
     const insertSql = `INSERT INTO ${cleanTable} (${columns.join(', ')}) VALUES (${placeholders})`;
     
-    // استخدام Transaction لتنفيذ كل الإدخالات معاً
     try {
       const results = [];
       for (const item of dataArray) {
@@ -300,25 +399,32 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 8️⃣ تحديث سجل (UPDATE)
+  // 9. update — تحديث سجل موجود
+  // ==========================================
+  // الاستخدام: تعديل بيانات سجل موجود
+  // يحتاج: حقل "data" بالبيانات الجديدة + حقل "where" لتحديد السجل
+  // مثال:
+  // {
+  //   "action": "update",
+  //   "table": "users",
+  //   "data": {"name": "أحمد المحدث", "age": "26"},
+  //   "where": [{"column": "id", "value": "1"}]
+  // }
   // ==========================================
   if (action === 'update') {
-    const data = body.data; // {name: 'أحمد المحدّث'}
-    const where = body.where; // [{column: 'id', value: 1}]
+    const data = body.data;
+    const where = body.where;
     if (!data || !where || Object.keys(data).length === 0 || where.length === 0) {
       response.status(400).json({ success: false, error: 'يجب إرسال "data" و "where"' });
       return;
     }
 
-    const setClauses = Object.keys(data).map(c => {
-      const col = String(c).replace(/[^a-zA-Z0-9_]/g, '');
-      return `${col} = ?`;
-    });
+    const setClauses = Object.keys(data).map(c => `${cleanColName(c)} = ?`);
     const values = Object.values(data);
 
     const conditions = [];
     where.forEach(w => {
-      const col = String(w.column).replace(/[^a-zA-Z0-9_]/g, '');
+      const col = cleanColName(w.column);
       conditions.push(`${col} = ?`);
       values.push(w.value);
     });
@@ -330,10 +436,14 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 9️⃣ حذف سجل (DELETE)
+  // 10. delete — حذف سجل
+  // ==========================================
+  // الاستخدام: حذف سجل أو أكثر حسب الشرط
+  // يحتاج: مصفوفة "where" لتحديد السجل المراد حذفه
+  // مثال: {"action": "delete", "table": "users", "where": [{"column": "id", "value": "1"}]}
   // ==========================================
   if (action === 'delete') {
-    const where = body.where; // [{column: 'id', value: 1}]
+    const where = body.where;
     if (!where || !Array.isArray(where) || where.length === 0) {
       response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة الشروط "where"' });
       return;
@@ -342,7 +452,7 @@ module.exports = async function handler(request, response) {
     const conditions = [];
     const values = [];
     where.forEach(w => {
-      const col = String(w.column).replace(/[^a-zA-Z0-9_]/g, '');
+      const col = cleanColName(w.column);
       conditions.push(`${col} = ?`);
       values.push(w.value);
     });
@@ -354,7 +464,17 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 🔟 تنفيذ استعلام SQL مخصص
+  // 11. raw_query — تنفيذ استعلام SQL مخصص
+  // ==========================================
+  // الاستخدام: تنفيذ أي استعلام SQL تريد (SELECT, UPDATE, DELETE, ...)
+  // يحتاج: حقل "sql" بالاستعلام + حقل "params" (اختياري) بالقيم
+  // ⚠️ تحذير: استخدم بحذر، لأنك ترسل SQL مباشرة
+  // مثال:
+  // {
+  //   "action": "raw_query",
+  //   "sql": "SELECT name, age FROM users WHERE age > ? ORDER BY age DESC",
+  //   "params": [18]
+  // }
   // ==========================================
   if (action === 'raw_query') {
     const sql = body.sql;
@@ -369,10 +489,21 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣1️⃣ تنفيذ عدة استعلامات (Batch)
+  // 12. batch — تنفيذ عدة استعلامات دفعة
+  // ==========================================
+  // الاستخدام: تنفيذ عدة استعلامات SQL في طلب واحد
+  // يحتاج: مصفوفة "statements" تحتوي على الاستعلامات
+  // مثال:
+  // {
+  //   "action": "batch",
+  //   "statements": [
+  //     {"sql": "INSERT INTO users (name) VALUES (?)", "args": ["أحمد"]},
+  //     {"sql": "INSERT INTO users (name) VALUES (?)", "args": ["محمد"]}
+  //   ]
+  // }
   // ==========================================
   if (action === 'batch') {
-    const statements = body.statements; // [{sql: '...', args: [...]}, ...]
+    const statements = body.statements;
     if (!statements || !Array.isArray(statements) || statements.length === 0) {
       response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة الاستعلامات في الحقل "statements"' });
       return;
@@ -383,11 +514,15 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣2️⃣ البحث (LIKE)
+  // 13. search — البحث بنص في الأعمدة
+  // ==========================================
+  // الاستخدام: البحث عن نص في أعمدة محددة باستخدام LIKE
+  // يحتاج: حقل "query" بنص البحث + حقل "columns" (اختياري)
+  // مثال: {"action": "search", "table": "users", "query": "أحمد", "columns": ["name"]}
   // ==========================================
   if (action === 'search') {
-    const query = body.query; // النص المراد البحث عنه
-    const columns = body.columns || []; // الأعمدة المراد البحث فيها
+    const query = body.query;
+    const searchColumns = body.columns || [];
     if (!query) {
       response.status(400).json({ success: false, error: 'يجب إرسال نص البحث في الحقل "query"' });
       return;
@@ -395,13 +530,13 @@ module.exports = async function handler(request, response) {
 
     let sql;
     const values = [];
-    if (columns.length > 0) {
-      const cleanCols = columns.map(c => String(c).replace(/[^a-zA-Z0-9_]/g, ''));
+    if (searchColumns.length > 0) {
+      const cleanCols = searchColumns.map(c => cleanColName(c));
       const likeConditions = cleanCols.map(c => `${c} LIKE ?`).join(' OR ');
       values.push(...cleanCols.map(() => `%${query}%`));
       sql = `SELECT * FROM ${cleanTable} WHERE ${likeConditions}`;
     } else {
-      sql = `SELECT * FROM ${cleanTable} WHERE 1=1`; // بدون أعمدة محددة، يعيد كل شيء
+      sql = `SELECT * FROM ${cleanTable}`;
     }
     const result = await executeSQL(sql, values);
     response.json(result);
@@ -409,7 +544,12 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣3️⃣ عد السجلات
+  // 14. count — عد السجلات
+  // ==========================================
+  // الاستخدام: معرفة عدد السجلات في الجدول (مع أو بدون شرط)
+  // مثال بدون شرط: {"action": "count", "table": "users"}
+  // مثال مع شرط: {"action": "count", "table": "users", "where": [{"column": "age", "value": "25"}]}
+  // الرد: {success: true, data: {rows: [{"total": 5}]}}
   // ==========================================
   if (action === 'count') {
     const where = body.where;
@@ -418,7 +558,7 @@ module.exports = async function handler(request, response) {
     if (where && Array.isArray(where) && where.length > 0) {
       const conditions = [];
       where.forEach(w => {
-        const col = String(w.column).replace(/[^a-zA-Z0-9_]/g, '');
+        const col = cleanColName(w.column);
         conditions.push(`${col} = ?`);
         values.push(w.value);
       });
@@ -430,7 +570,11 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣4️⃣ جلب أعمدة الجدول
+  // 15. get_columns — جلب معلومات أعمدة الجدول
+  // ==========================================
+  // الاستخدام: معرفة أسماء الأعمدة وأنواعها في جدول معين
+  // مثال: {"action": "get_columns", "table": "users"}
+  // الرد: {success: true, data: {rows: [{name: "id", type: "INTEGER", ...}, ...]}}
   // ==========================================
   if (action === 'get_columns') {
     const sql = `PRAGMA table_info(${cleanTable})`;
@@ -440,7 +584,12 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣5️⃣ جلب جميع الجداول
+  // 16. get_tables — جلب أسماء جميع الجداول
+  // ==========================================
+  // الاستخدام: معرفة ما هي الجداول الموجودة في قاعدة البيانات
+  // لا يحتاج اسم جدول
+  // مثال: {"action": "get_tables"}
+  // الرد: {success: true, data: {rows: [{name: "users"}, {name: "products"}]}}
   // ==========================================
   if (action === 'get_tables') {
     const sql = `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`;
@@ -450,29 +599,18 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣6️⃣ حذف شرط (DELETE WHERE)
+  // 17. query_order — استعلام مع شروط وترتيب
   // ==========================================
-  if (action === 'delete_where') {
-    const where = body.where;
-    if (!where || !Array.isArray(where) || where.length === 0) {
-      response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة الشروط "where"' });
-      return;
-    }
-    const conditions = [];
-    const values = [];
-    where.forEach(w => {
-      const col = String(w.column).replace(/[^a-zA-Z0-9_]/g, '');
-      conditions.push(`${col} = ?`);
-      values.push(w.value);
-    });
-    const sql = `DELETE FROM ${cleanTable} WHERE ${conditions.join(' AND ')}`;
-    const result = await executeSQL(sql, values);
-    response.json(result);
-    return;
-  }
-
-  // ==========================================
-  // 1️⃣7️⃣ استعلام مخصص مع ترتيب
+  // الاستخدام: جلب سجلات مع فلترة + ترتيب + حد
+  // يدعم: WHERE + ORDER BY + LIMIT
+  // مثال:
+  // {
+  //   "action": "query_order",
+  //   "table": "users",
+  //   "where": [{"column": "age", "value": "18", "operator": ">="}],
+  //   "orderBy": [{"column": "name", "direction": "ASC"}],
+  //   "limit": 20
+  // }
   // ==========================================
   if (action === 'query_order') {
     const where = body.where || [];
@@ -482,7 +620,7 @@ module.exports = async function handler(request, response) {
     const conditions = [];
     const values = [];
     where.forEach(w => {
-      const col = String(w.column).replace(/[^a-zA-Z0-9_]/g, '');
+      const col = cleanColName(w.column);
       const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase())
         ? String(w.operator || '=').toUpperCase() : '=';
       conditions.push(`${col} ${op} ?`);
@@ -495,7 +633,7 @@ module.exports = async function handler(request, response) {
     }
     if (orderBy.length > 0) {
       const orderClauses = orderBy.map(o => {
-        const col = String(o.column).replace(/[^a-zA-Z0-9_]/g, '');
+        const col = cleanColName(o.column);
         const dir = String(o.direction || 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
         return `${col} ${dir}`;
       });
@@ -511,7 +649,17 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 1️⃣8️⃣ تحديث أو إضافة (UPSERT)
+  // 18. upsert — إضافة أو تحديث (إذا وجد)
+  // ==========================================
+  // الاستخدام: إذا السجل موجود يتم تحديثه، إذا غير موجود يتم إضافته
+  // يعتمد على وجود عمود فريد (id افتراضياً)
+  // مثال:
+  // {
+  //   "action": "upsert",
+  //   "table": "users",
+  //   "data": {"id": 1, "name": "أحمد", "age": "25"},
+  //   "uniqueColumn": "id"
+  // }
   // ==========================================
   if (action === 'upsert') {
     const data = body.data;
@@ -521,13 +669,38 @@ module.exports = async function handler(request, response) {
       return;
     }
 
-    const columns = Object.keys(data).map(c => String(c).replace(/[^a-zA-Z0-9_]/g, ''));
+    const columns = Object.keys(data).map(c => cleanColName(c));
     const placeholders = columns.map(() => '?').join(', ');
     const values = columns.map(c => data[c]);
     
-    // استخدام INSERT OR REPLACE
-    const uniqueCol = String(uniqueColumn).replace(/[^a-zA-Z0-9_]/g, '');
     const sql = `INSERT OR REPLACE INTO ${cleanTable} (${columns.join(', ')}) VALUES (${placeholders})`;
+    const result = await executeSQL(sql, values);
+    response.json(result);
+    return;
+  }
+
+  // ==========================================
+  // 19. delete_where — حذف بعدة شروط
+  // ==========================================
+  // الاستخدام: حذف سجلات حسب عدة شروط
+  // مثال: {"action": "delete_where", "table": "users", "where": [{"column": "age", "value": "20", "operator": "<"}]}
+  // ==========================================
+  if (action === 'delete_where') {
+    const where = body.where;
+    if (!where || !Array.isArray(where) || where.length === 0) {
+      response.status(400).json({ success: false, error: 'يجب إرسال مصفوفة الشروط "where"' });
+      return;
+    }
+    const conditions = [];
+    const values = [];
+    where.forEach(w => {
+      const col = cleanColName(w.column);
+      const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase())
+        ? String(w.operator || '=').toUpperCase() : '=';
+      conditions.push(`${col} ${op} ?`);
+      values.push(w.value);
+    });
+    const sql = `DELETE FROM ${cleanTable} WHERE ${conditions.join(' AND ')}`;
     const result = await executeSQL(sql, values);
     response.json(result);
     return;
@@ -538,6 +711,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   response.status(400).json({
     success: false,
-    error: 'إجراء غير معروف. الإجراءات المتاحة: ping, create_table, drop_table, get_all, get_by_id, get_where, insert, batch_insert, update, delete, raw_query, batch, search, count, get_columns, get_tables, delete_where, query_order, upsert'
+    error: 'إجراء غير معروف. الإجراءات: ping, create_table, drop_table, get_all, get_by_id, get_where, insert, batch_insert, update, delete, raw_query, batch, search, count, get_columns, get_tables, query_order, upsert, delete_where'
   });
 }
