@@ -4,8 +4,8 @@ const { createClient } = require('@libsql/client');
 // إعداد الاتصال بقاعدة بيانات Turso
 // ============================================
 const client = createClient({
-  url: process.env.TURSO_DATABASE_URL,
-  authToken: process.env.TURSO_AUTH_TOKEN,
+  url: process.env.TURSO_DATABASE_URL || '',
+  authToken: process.env.TURSO_AUTH_TOKEN || '',
 });
 
 // ============================================
@@ -30,6 +30,27 @@ function cleanTableName(name) {
   return String(name).replace(/[^a-zA-Z0-9_]/g, '');
 }
 
+// تنظيف قيمة المدخلات (حماية من SQL Injection)
+function sanitizeValue(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number') return value;
+  return String(value);
+}
+
+// التحقق من وجود جدول
+async function tableExists(tableName) {
+  try {
+    const result = await client.execute({
+      sql: `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
+      args: [tableName]
+    });
+    return result.rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+// تنفيذ SQL مع معالجة أخطاء شاملة
 async function executeSQL(sql, params = []) {
   try {
     const result = await client.execute({ sql, args: params });
@@ -53,6 +74,7 @@ async function executeSQL(sql, params = []) {
   }
 }
 
+// تنفيذ عدة استعلامات
 async function executeBatch(statements) {
   const results = [];
   try {
@@ -83,17 +105,23 @@ async function executeBatch(statements) {
   }
 }
 
-// التحقق من وجود جدول
-async function tableExists(tableName) {
-  try {
-    const result = await client.execute({
-      sql: `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
-      args: [tableName]
-    });
-    return result.rows.length > 0;
-  } catch {
-    return false;
-  }
+// إنشاء جدول تلقائياً بناءً على البيانات المرسلة
+async function autoCreateTable(cleanTable, dataKeys, firstRow) {
+  const colDefs = dataKeys.map(k => {
+    const name = cleanColName(k);
+    const val = firstRow[k];
+    // تحديد النوع: إذا كان رقم صحيح = INTEGER، رقم عشري = REAL، غير ذلك = TEXT
+    let type = 'TEXT';
+    if (typeof val === 'number') {
+      type = Number.isInteger(val) ? 'INTEGER' : 'REAL';
+    } else if (typeof val === 'string' && /^\d+$/.test(val)) {
+      type = 'INTEGER';
+    }
+    return `${name} ${type}`;
+  });
+  // إنشاء بدون AUTOINCREMENT — لأن المستخدم قد يريد إدخال ID يدوياً
+  const createSql = `CREATE TABLE IF NOT EXISTS ${cleanTable} (id INTEGER PRIMARY KEY, ${colDefs.join(', ')})`;
+  return await executeSQL(createSql);
 }
 
 // ============================================
@@ -118,27 +146,26 @@ module.exports = async function handler(request, response) {
     return;
   }
 
-  // قراءة البيانات المرسلة
+  // قراءة البيانات المرسلة (JSON)
   let body = {};
-  if (request.body) {
-    if (typeof request.body === 'string') {
-      try { body = JSON.parse(request.body); } catch (e) { body = {}; }
-    } else {
-      body = request.body;
+  try {
+    if (request.body) {
+      if (typeof request.body === 'string') {
+        body = JSON.parse(request.body);
+      } else {
+        body = request.body;
+      }
     }
+  } catch (e) {
+    response.status(400).json({ success: false, error: 'بيانات JSON غير صالحة: ' + e.message });
+    return;
   }
 
-  const action = body.action || request.query.action;
-  const table = body.table || request.query.table;
+  const action = body.action || request.query.action || '';
+  const table = body.table || request.query.table || '';
 
   // ==========================================
   // 1. ping — اختبار الاتصال بالخادم
-  // ==========================================
-  // ماذا يفعل: يتأكد أن الخادم يعمل ومتصل بقاعدة البيانات
-  // متى تستخدمه: عند تشغيل التطبيق للتأكد من أن كل شيء جاهز
-  // ماذا ترجع: رسالة نجاح + اسم قاعدة البيانات + الوقت
-  // مثال من Sketchware:
-  //   action = ping
   // ==========================================
   if (action === 'ping') {
     response.json({
@@ -159,8 +186,9 @@ module.exports = async function handler(request, response) {
     return;
   }
 
+  let cleanTable = '';
   if (table) {
-    var cleanTable = cleanTableName(table);
+    cleanTable = cleanTableName(table);
     if (!cleanTable) {
       response.status(400).json({ success: false, error: 'اسم الجدول غير صالح' });
       return;
@@ -172,7 +200,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // ماذا يفعل: ينشئ جدول جديد في قاعدة البيانات
   // متى تستخدمه: عند تشغيل التطبيق لأول مرة لإنشاء الجداول
-  // ماذا يرجع: نجاح أو خطأ
   // 
   // ** حل مشكلة التكرار: **
   // إذا الضغطت مرتين، لن يظهر خطأ! لأن SQL يستخدم
@@ -182,6 +209,11 @@ module.exports = async function handler(request, response) {
   // ** حل مشكلة الأعمدة الإضافية: **
   // إذا أرسلت أعمدة جديدة والجدول موجود، سيضيفها تلقائياً
   // كـ "ALTER TABLE ADD COLUMN" إذا لم تكن موجودة
+  //
+  // ** ملاحظة مهمة عن الـ ID: **
+  // إذا حددت عمود id كـ primaryKey=true و autoIncrement=false
+  // سيتمكن المستخدم من إدخال ID يدوياً
+  // مثال: {"name": "id", "type": "INTEGER", "primaryKey": true}
   // ==========================================
   if (action === 'create_table') {
     const columns = body.columns;
@@ -190,11 +222,12 @@ module.exports = async function handler(request, response) {
       return;
     }
 
-    // أولاً: إنشاء الجدول (إذا لم يكن موجود)
     const colDefs = columns.map(col => {
       const name = cleanColName(col.name);
       const type = String(col.type || 'TEXT').toUpperCase();
       const isPrimary = col.primaryKey ? ' PRIMARY KEY' : '';
+      // ** التعديل: لا نضيف AUTOINCREMENT افتراضياً **
+      // المستخدم يتحكم بإضافتها بنفسه عبر autoIncrement: true
       const isAutoIncrement = col.autoIncrement ? ' AUTOINCREMENT' : '';
       const isNotNull = col.notNull ? ' NOT NULL' : '';
       const isUnique = col.unique ? ' UNIQUE' : '';
@@ -204,21 +237,22 @@ module.exports = async function handler(request, response) {
 
     const hasPrimary = columns.some(c => c.primaryKey);
     if (!hasPrimary) {
-      colDefs.unshift('id INTEGER PRIMARY KEY AUTOINCREMENT');
+      // إذا لم يحدد المستخدم primaryKey، نضيف id تلقائياً
+      // بدون AUTOINCREMENT — يسمح بإدخال ID يدوياً
+      colDefs.unshift('id INTEGER PRIMARY KEY');
     }
 
     const createSql = `CREATE TABLE IF NOT EXISTS ${cleanTable} (${colDefs.join(', ')})`;
     await executeSQL(createSql);
 
-    // ثانياً: التحقق من الأعمدة وإضافة الناقصة (ALTER TABLE)
+    // التحقق من الأعمدة وإضافة الناقصة (ALTER TABLE)
     try {
       const existingCols = await client.execute({ sql: `PRAGMA table_info(${cleanTable})` });
-      const existingNames = existingCols.rows.map(r => r[1]); // index 1 = name
+      const existingNames = existingCols.rows.map(r => r[1]);
 
       for (const col of columns) {
         const colName = cleanColName(col.name);
         if (!existingNames.includes(colName)) {
-          // هذا العمود غير موجود — أضفه
           const type = String(col.type || 'TEXT').toUpperCase();
           const isNotNull = col.notNull ? ' NOT NULL' : '';
           const isUnique = col.unique ? ' UNIQUE' : '';
@@ -242,13 +276,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 3. drop_table — حذف جدول بالكامل
   // ==========================================
-  // ماذا يفعل: يحذف الجدول وكل بياناته نهائياً
-  // متى تستخدمه: نادراً — في لوحات التحكم الإدارية فقط
-  // تحذير: لا يمكن التراجع! البيانات تضيع للأبد
-  // مثال من Sketchware:
-  //   action = drop_table
-  //   table = جدول_قديم
-  // ==========================================
   if (action === 'drop_table') {
     const sql = `DROP TABLE IF EXISTS ${cleanTable}`;
     const result = await executeSQL(sql);
@@ -259,18 +286,10 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 4. get_all — جلب جميع السجلات
   // ==========================================
-  // ماذا يفعل: يجلب كل البيانات الموجودة في الجدول
-  // متى تستخدمه: عند فتح صفحة تعرض قائمة بكل العناصر
-  // ماذا يرجع: مصفوفة بكل السجلات (أعمدة + صفوف)
-  // مثال من Sketchware:
-  //   action = get_all
-  //   table = users
-  // ==========================================
   if (action === 'get_all') {
-    // إذا الجدول غير موجود، ارجع رسالة واضحة بدل خطأ
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      response.json({ success: true, data: { columns: [], rows: [], rowsAffected: 0, message: 'الجدول غير موجود (لا توجد بيانات)' } });
+      response.json({ success: true, data: { columns: [], rows: [], rowsAffected: 0, message: 'الجدول غير موجود' } });
       return;
     }
     const sql = `SELECT * FROM ${cleanTable}`;
@@ -281,14 +300,6 @@ module.exports = async function handler(request, response) {
 
   // ==========================================
   // 5. get_by_id — جلب سجل واحد بالـ ID
-  // ==========================================
-  // ماذا يفعل: يجلب سجل واحد فقط باستخدام رقمه
-  // متى تستخدمه: عند فتح صفحة تفاصيل عنصر معين
-  // ماذا يرجع: سجل واحد أو مصفوفة فارغة إذا لم يوجد
-  // مثال من Sketchware:
-  //   action = get_by_id
-  //   table = users
-  //   id = 5
   // ==========================================
   if (action === 'get_by_id') {
     const id = body.id;
@@ -310,16 +321,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 6. get_where — جلب سجلات بشرط محدد
   // ==========================================
-  // ماذا يفعل: يجلب سجلات محددة بناءً على شروط
-  // متى تستخدمه: جلب مستخدمين بعمر معين، أو منتجات بقسم معين
-  // يدعم: =, !=, >, <, >=, <=, LIKE, NOT LIKE
-  // يدعم: LIMIT لتحديد عدد النتائج
-  // مثال من Sketchware:
-  //   action = get_where
-  //   table = users
-  //   where = [{"column": "age", "value": "18", "operator": ">="}]
-  //   limit = 10
-  // ==========================================
   if (action === 'get_where') {
     const where = body.where;
     if (!where || !Array.isArray(where) || where.length === 0) {
@@ -340,7 +341,7 @@ module.exports = async function handler(request, response) {
       const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase())
         ? String(w.operator || '=').toUpperCase() : '=';
       conditions.push(`${col} ${op} ?`);
-      values.push(w.value);
+      values.push(sanitizeValue(w.value));
     });
 
     const limit = body.limit ? ` LIMIT ${parseInt(body.limit)}` : '';
@@ -351,32 +352,30 @@ module.exports = async function handler(request, response) {
   }
 
   // ==========================================
-  // 7. insert — إضافة سجل جديد (الطريقة المباشرة)
+  // 7. insert — إضافة سجل جديد
   // ==========================================
-  // ماذا يفعل: يضيف سجل جديد إلى الجدول
-  // متى تستخدمه: عند تسجيل مستخدم، إضافة منتج، نشر تعليق
+  // ** التعديل الأساسي: تم إصلاح مشكلة الـ ID **
   // 
-  // ** حل مشكلة "الجدول غير موجود": **
-  // إذا الجدول غير موجود، الخادم سينشئه تلقائياً!
-  // يأخذ أسماء الحقول التي أرسلتها ويستخدمها كأعمدة
-  // أنواع الأعمدة: إذا القيمة رقم = INTEGER، وإلا = TEXT
+  // الآن الخادم يدعم إدخال ID يدوياً:
+  // - إذا أرسلت حقل "id" في الـ Map، سيتم استخدامه كـ ID
+  // - إذا لم ترسل "id"، سيحاول الخادم توليد رقم تلقائي
   //
-  // الطريقة الأولى (مباشرة - الأسهل لـ Sketchware):
+  // الطريقة المباشرة (من Sketchware):
   //   action = insert
   //   table = users
-  //   name = أحمد       ← يضاف كحقل
-  //   email = a@b.com  ← يضاف كحقل
-  //   uid = 12345      ← يضاف كحقل
+  //   id = 388       ← هذا سيُستخدم كـ ID فعلي!
+  //   name = أحمد
+  //   email = a@b.com
   //
-  // الطريقة الثانية (مغلفة):
+  // الطريقة المغلفة:
   //   action = insert
   //   table = users
-  //   data = {"name": "أحمد", "email": "a@b.com"}
+  //   data = {"id": 388, "name": "أحمد", "email": "a@b.com"}
   //
   // كلا الطريقتين تعملان!
   // ==========================================
   if (action === 'insert') {
-    const reservedKeys = ['action', 'table', 'data', 'where', 'columns', 'id', 'query', 
+    const reservedKeys = ['action', 'table', 'data', 'where', 'columns', 'query', 
                           'limit', 'orderBy', 'uniqueColumn', 'sql', 'params', 'statements'];
     const dataKeys = Object.keys(body).filter(k => !reservedKeys.includes(k));
     
@@ -391,22 +390,21 @@ module.exports = async function handler(request, response) {
       return;
     }
 
-    // ** حل ذكي: إذا الجدول غير موجود، أنشئه تلقائياً **
+    // إذا الجدول غير موجود، أنشئه تلقائياً
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      const colDefs = Object.keys(data).map(k => {
-        const name = cleanColName(k);
-        const val = data[k];
-        const type = (typeof val === 'number' || /^\d+$/.test(String(val))) ? 'INTEGER' : 'TEXT';
-        return `${name} ${type}`;
-      });
-      const createSql = `CREATE TABLE IF NOT EXISTS ${cleanTable} (id INTEGER PRIMARY KEY AUTOINCREMENT, ${colDefs.join(', ')})`;
-      await executeSQL(createSql);
+      // ** إنشاء الجدول بدون AUTOINCREMENT **
+      await autoCreateTable(cleanTable, Object.keys(data), data);
     }
 
+    // التحقق من وجود عمود id في البيانات
     const columns = Object.keys(data).map(c => cleanColName(c));
+    
+    // إذا لم يوجد عمود id، أنشئ صف بدون id (SQLite سيولّد تلقائياً)
+    // أو إذا كان id مرسلاً من المستخدم، سيُستخدم كما هو
+    
     const placeholders = columns.map(() => '?').join(', ');
-    const values = columns.map(c => data[c]);
+    const values = columns.map(c => sanitizeValue(data[c]));
     const sql = `INSERT INTO ${cleanTable} (${columns.join(', ')}) VALUES (${placeholders})`;
     const result = await executeSQL(sql, values);
     response.json(result);
@@ -416,13 +414,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 8. batch_insert — إضافة عدة سجلات دفعة واحدة
   // ==========================================
-  // ماذا يفعل: يضيف عدة سجلات في طلب واحد (أسرع وأوفر)
-  // متى تستخدمه: عند استيراد بيانات أو تحميل عدة عناصر دفعة
-  // مثال من Sketchware:
-  //   action = batch_insert
-  //   table = users
-  //   data = [{"name": "أحمد"}, {"name": "محمد"}]
-  // ==========================================
   if (action === 'batch_insert') {
     const dataArray = body.data;
     if (!dataArray || !Array.isArray(dataArray) || dataArray.length === 0) {
@@ -430,17 +421,10 @@ module.exports = async function handler(request, response) {
       return;
     }
 
-    // إذا الجدول غير موجود، أنشئه تلقائياً
+    // إذا الجدول غير موجود، أنشئه
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      const colDefs = Object.keys(dataArray[0]).map(k => {
-        const name = cleanColName(k);
-        const val = dataArray[0][k];
-        const type = (typeof val === 'number' || /^\d+$/.test(String(val))) ? 'INTEGER' : 'TEXT';
-        return `${name} ${type}`;
-      });
-      const createSql = `CREATE TABLE IF NOT EXISTS ${cleanTable} (id INTEGER PRIMARY KEY AUTOINCREMENT, ${colDefs.join(', ')})`;
-      await executeSQL(createSql);
+      await autoCreateTable(cleanTable, Object.keys(dataArray[0]), dataArray[0]);
     }
 
     const columns = Object.keys(dataArray[0]).map(c => cleanColName(c));
@@ -450,7 +434,7 @@ module.exports = async function handler(request, response) {
     try {
       const results = [];
       for (const item of dataArray) {
-        const values = columns.map(c => item[c]);
+        const values = columns.map(c => sanitizeValue(item[c]));
         const result = await client.execute({ sql: insertSql, args: values });
         results.push({ lastInsertRowid: result.lastInsertRowid });
       }
@@ -471,15 +455,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 9. update — تحديث سجل موجود
   // ==========================================
-  // ماذا يفعل: يعدّل بيانات سجل موجود
-  // متى تستخدمه: عند تعديل اسم المستخدم أو تحديث حالة طلب
-  // يحتاج: data (البيانات الجديدة) + where (لتحديد السجل)
-  // مثال من Sketchware:
-  //   action = update
-  //   table = users
-  //   data = {"name": "أحمد المحدث", "age": "26"}
-  //   where = [{"column": "id", "value": "1"}]
-  // ==========================================
   if (action === 'update') {
     const data = body.data;
     const where = body.where;
@@ -490,18 +465,18 @@ module.exports = async function handler(request, response) {
 
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      response.json({ success: true, data: { rowsAffected: 0, message: 'الجدول غير موجود - لا شيء للتحديث' } });
+      response.json({ success: true, data: { rowsAffected: 0, message: 'الجدول غير موجود' } });
       return;
     }
 
     const setClauses = Object.keys(data).map(c => `${cleanColName(c)} = ?`);
-    const values = Object.values(data);
+    const values = Object.values(data).map(v => sanitizeValue(v));
 
     const conditions = [];
     where.forEach(w => {
       const col = cleanColName(w.column);
       conditions.push(`${col} = ?`);
-      values.push(w.value);
+      values.push(sanitizeValue(w.value));
     });
 
     const sql = `UPDATE ${cleanTable} SET ${setClauses.join(', ')} WHERE ${conditions.join(' AND ')}`;
@@ -513,13 +488,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 10. delete — حذف سجل
   // ==========================================
-  // ماذا يفعل: يحذف سجل أو أكثر حسب الشرط
-  // متى تستخدمه: عند حذف مستخدم أو منتج أو رسالة
-  // مثال من Sketchware:
-  //   action = delete
-  //   table = users
-  //   where = [{"column": "id", "value": "1"}]
-  // ==========================================
   if (action === 'delete') {
     const where = body.where;
     if (!where || !Array.isArray(where) || where.length === 0) {
@@ -529,7 +497,7 @@ module.exports = async function handler(request, response) {
 
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      response.json({ success: true, data: { rowsAffected: 0, message: 'الجدول غير موجود - لا شيء للحذف' } });
+      response.json({ success: true, data: { rowsAffected: 0, message: 'الجدول غير موجود' } });
       return;
     }
 
@@ -538,7 +506,7 @@ module.exports = async function handler(request, response) {
     where.forEach(w => {
       const col = cleanColName(w.column);
       conditions.push(`${col} = ?`);
-      values.push(w.value);
+      values.push(sanitizeValue(w.value));
     });
 
     const sql = `DELETE FROM ${cleanTable} WHERE ${conditions.join(' AND ')}`;
@@ -549,14 +517,6 @@ module.exports = async function handler(request, response) {
 
   // ==========================================
   // 11. raw_query — تنفيذ استعلام SQL مخصص
-  // ==========================================
-  // ماذا يفعل: ينفذ أي استعلام SQL تريده
-  // متى تستخدمه: للعمليات المعقدة التي لا يمكن بالكتل الجاهزة
-  // تحذير: استخدم بحذر، لأنك ترسل SQL مباشرة
-  // مثال من Sketchware:
-  //   action = raw_query
-  //   sql = SELECT name, age FROM users WHERE age > ? ORDER BY age DESC
-  //   params = ["18"]
   // ==========================================
   if (action === 'raw_query') {
     const sql = body.sql;
@@ -573,12 +533,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 12. batch — تنفيذ عدة استعلامات دفعة
   // ==========================================
-  // ماذا يفعل: ينفذ عدة استعلامات SQL في طلب واحد
-  // متى تستخدمه: حذف من جدول وإضافة لجدول آخر في نفس اللحظة
-  // مثال من Sketchware:
-  //   action = batch
-  //   statements = [{"sql": "INSERT INTO users (name) VALUES (?)", "args": ["أحمد"]}]
-  // ==========================================
   if (action === 'batch') {
     const statements = body.statements;
     if (!statements || !Array.isArray(statements) || statements.length === 0) {
@@ -592,14 +546,6 @@ module.exports = async function handler(request, response) {
 
   // ==========================================
   // 13. search — البحث بنص في الأعمدة
-  // ==========================================
-  // ماذا يفعل: يبحث عن نص في أعمدة محددة باستخدام LIKE
-  // متى تستخدمه: في شريط البحث للبحث عن اسم أو منتج
-  // مثال من Sketchware:
-  //   action = search
-  //   table = users
-  //   query = أحمد
-  //   columns = ["name"]
   // ==========================================
   if (action === 'search') {
     const query = body.query;
@@ -627,12 +573,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 14. count — عد السجلات
   // ==========================================
-  // ماذا يفعل: يعرف عدد السجلات في الجدول (مع أو بدون شرط)
-  // متى تستخدمه: لمعرفة عدد المستخدمين الكلي أو المنتجات المتاحة
-  // مثال بدون شرط: action = count, table = users
-  // مثال مع شرط: action = count, table = users, where = [{"column": "age", "value": "25"}]
-  // الرد: {success: true, data: {rows: [{"total": 5}]}}
-  // ==========================================
   if (action === 'count') {
     const exists = await tableExists(cleanTable);
     if (!exists) {
@@ -647,7 +587,7 @@ module.exports = async function handler(request, response) {
       where.forEach(w => {
         const col = cleanColName(w.column);
         conditions.push(`${col} = ?`);
-        values.push(w.value);
+        values.push(sanitizeValue(w.value));
       });
       sql += ` WHERE ${conditions.join(' AND ')}`;
     }
@@ -658,13 +598,6 @@ module.exports = async function handler(request, response) {
 
   // ==========================================
   // 15. get_columns — جلب معلومات أعمدة الجدول
-  // ==========================================
-  // ماذا يفعل: يجلب أسماء وأنواع الأعمدة في جدول
-  // متى تستخدمه: نادراً — عند بناء تطبيق ديناميكي
-  // مثال من Sketchware:
-  //   action = get_columns
-  //   table = users
-  // الرد: {rows: [{name: "id", type: "INTEGER"}, ...]}
   // ==========================================
   if (action === 'get_columns') {
     const exists = await tableExists(cleanTable);
@@ -681,12 +614,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 16. get_tables — جلب أسماء جميع الجداول
   // ==========================================
-  // ماذا يفعل: يجلب أسماء كل الجداول في قاعدة البيانات
-  // متى تستخدمه: نادراً — للمطورين فقط
-  // مثال من Sketchware:
-  //   action = get_tables
-  // الرد: {rows: [{name: "users"}, {name: "products"}]}
-  // ==========================================
   if (action === 'get_tables') {
     const sql = `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`;
     const result = await executeSQL(sql);
@@ -696,15 +623,6 @@ module.exports = async function handler(request, response) {
 
   // ==========================================
   // 17. query_order — استعلام مع شروط وترتيب
-  // ==========================================
-  // ماذا يفعل: يجلب سجلات مع فلترة + ترتيب + حد
-  // متى تستخدمه: جلب أحدث 10 مقالات، أو أرخص 5 منتجات
-  // مثال من Sketchware:
-  //   action = query_order
-  //   table = users
-  //   where = [{"column": "age", "value": "18", "operator": ">="}]
-  //   orderBy = [{"column": "name", "direction": "ASC"}]
-  //   limit = 20
   // ==========================================
   if (action === 'query_order') {
     const where = body.where || [];
@@ -724,7 +642,7 @@ module.exports = async function handler(request, response) {
       const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase())
         ? String(w.operator || '=').toUpperCase() : '=';
       conditions.push(`${col} ${op} ?`);
-      values.push(w.value);
+      values.push(sanitizeValue(w.value));
     });
 
     let sql = `SELECT * FROM ${cleanTable}`;
@@ -751,15 +669,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 18. upsert — إضافة أو تحديث (إذا وجد)
   // ==========================================
-  // ماذا يفعل: إذا السجل موجود يحدثه، إذا غير موجود يضيفه
-  // متى تستخدمه: عند تحديث إعدادات المستخدم (إذا لم توجد يتم إنشاؤها)
-  // يعتمد على وجود عمود فريد (id افتراضياً)
-  // مثال من Sketchware:
-  //   action = upsert
-  //   table = users
-  //   data = {"id": 1, "name": "أحمد", "age": "25"}
-  //   uniqueColumn = id
-  // ==========================================
   if (action === 'upsert') {
     const data = body.data;
     const uniqueColumn = body.uniqueColumn || 'id';
@@ -771,19 +680,12 @@ module.exports = async function handler(request, response) {
     // إذا الجدول غير موجود، أنشئه
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      const colDefs = Object.keys(data).map(k => {
-        const name = cleanColName(k);
-        const val = data[k];
-        const type = (typeof val === 'number' || /^\d+$/.test(String(val))) ? 'INTEGER' : 'TEXT';
-        return `${name} ${type}`;
-      });
-      const createSql = `CREATE TABLE IF NOT EXISTS ${cleanTable} (id INTEGER PRIMARY KEY AUTOINCREMENT, ${colDefs.join(', ')})`;
-      await executeSQL(createSql);
+      await autoCreateTable(cleanTable, Object.keys(data), data);
     }
 
     const columns = Object.keys(data).map(c => cleanColName(c));
     const placeholders = columns.map(() => '?').join(', ');
-    const values = columns.map(c => data[c]);
+    const values = columns.map(c => sanitizeValue(data[c]));
     
     const sql = `INSERT OR REPLACE INTO ${cleanTable} (${columns.join(', ')}) VALUES (${placeholders})`;
     const result = await executeSQL(sql, values);
@@ -794,13 +696,6 @@ module.exports = async function handler(request, response) {
   // ==========================================
   // 19. delete_where — حذف بعدة شروط
   // ==========================================
-  // ماذا يفعل: يحذف سجلات حسب عدة شروط
-  // متى تستخدمه: حذف كل المستخدمين غير النشطين
-  // مثال من Sketchware:
-  //   action = delete_where
-  //   table = users
-  //   where = [{"column": "age", "value": "20", "operator": "<"}]
-  // ==========================================
   if (action === 'delete_where') {
     const where = body.where;
     if (!where || !Array.isArray(where) || where.length === 0) {
@@ -810,7 +705,7 @@ module.exports = async function handler(request, response) {
 
     const exists = await tableExists(cleanTable);
     if (!exists) {
-      response.json({ success: true, data: { rowsAffected: 0, message: 'الجدول غير موجود - لا شيء للحذف' } });
+      response.json({ success: true, data: { rowsAffected: 0, message: 'الجدول غير موجود' } });
       return;
     }
 
@@ -821,7 +716,7 @@ module.exports = async function handler(request, response) {
       const op = ['=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE'].includes(String(w.operator || '=').toUpperCase())
         ? String(w.operator || '=').toUpperCase() : '=';
       conditions.push(`${col} ${op} ?`);
-      values.push(w.value);
+      values.push(sanitizeValue(w.value));
     });
     const sql = `DELETE FROM ${cleanTable} WHERE ${conditions.join(' AND ')}`;
     const result = await executeSQL(sql, values);
@@ -836,5 +731,4 @@ module.exports = async function handler(request, response) {
     success: false,
     error: 'إجراء غير معروف. الإجراءات: ping, create_table, drop_table, get_all, get_by_id, get_where, insert, batch_insert, update, delete, raw_query, batch, search, count, get_columns, get_tables, query_order, upsert, delete_where'
   });
-}
-
+                     }
