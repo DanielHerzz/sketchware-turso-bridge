@@ -1,0 +1,12 @@
+{
+  "name": "sketchware-turso-bridge",
+  "version": "1.0.0",
+  "description": "جسر ديناميكي بين Sketchware Pro و Turso Database - يعمل على Vercel",
+  "private": true,
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.14.0"
+  }
+}
